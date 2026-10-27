@@ -18,7 +18,7 @@ body{touch-action:none;overscroll-behavior:none;-webkit-user-select:none;user-se
 .tb.on{background:rgba(255,200,90,.65)}
 .tb.r{border-radius:50%;width:76px;height:76px;line-height:72px;font-size:28px}
 .tb.s{width:46px;height:28px;line-height:24px;font-size:12px;border-radius:8px}
-</style><script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script></head><body><canvas id="c" width="960" height="540"></canvas><div id="tc"></div>
+</style></head><body><canvas id="c" width="960" height="540"></canvas><div id="tc"></div>
 <script>
 const C=document.getElementById('c'),X=C.getContext('2d');
 const GY=400,G=.8,LW=70,RW=890,K={};
@@ -1733,69 +1733,48 @@ function press(c){if(TR.on||(ol.st==='error'&&sc!=='online'))return;auInit();if(
  if(!g){if(ok)sfx('ok');else if(c==='Escape')sfx('back');else if(st()!==a)sfx('move')}else if(c==='Escape')sfx('back')}
 
 
-/* ---------- ONLINE: PeerJS (signaling via PeerJS cloud, match itself is peer-to-peer WebRTC) ----------
-   Host registers the peer id "rf-CODE"; guest connects to it with two DataConnections:
-     'ctl' = reliable + ordered (picks, start, welcome, bye)    'in' = unordered (per-frame inputs, ping)
-   Optional URL params:  ?peerhost=my.peerserver.com&peerport=443&peerpath=/&peersecure=1  -> your own PeerServer
-                         ?turn=turn:host:3478,user,pass  -> adds a TURN relay for strict NATs / mobile data */
+/* ---------- ONLINE: WebSocket relay (signal_server.js serves this page and relays frames between the two players) ----------
+   Host sends {t:'host',code}; guest sends {t:'join',code}. Server answers 'hosted' / 'joined' / 'peer' / 'bye' / 'err' / 'full'.
+   Once paired, every frame (picks, start, per-frame inputs, ping) is relayed untouched to the opponent. */
 const QS=new URLSearchParams(location.search);
 const RALPH='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 let ol={st:'choose',i:0,code:'',in:'',msg:'',peer:null,role:null,pk:null,dc:null,dcs:'',cc:null,ccs:'',pcs:'',id:Math.random().toString(36).slice(2,9),tO:0,ne:{a:0,s:0,dq:0},stall:0};
-/* PeerJS closes the link the instant ICE reports a (often transient) 'disconnected'. Give it 12s to recover first. */
-(()=>{if(typeof RTCPeerConnection==='undefined')return;const d=Object.getOwnPropertyDescriptor(RTCPeerConnection.prototype,'oniceconnectionstatechange');if(!d||!d.set)return;
- Object.defineProperty(RTCPeerConnection.prototype,'oniceconnectionstatechange',{configurable:true,get:d.get,set(fn){const pc=this;
-  d.set.call(this,typeof fn==='function'?function(e){clearTimeout(pc._dt);if(pc.iceConnectionState==='disconnected'){pc._dt=setTimeout(()=>{if(pc.iceConnectionState==='disconnected')fn.call(pc,e)},12000);return}fn.call(pc,e)}:fn)}})})();
-const ICE_SERVERS=[
- {urls:['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302','stun:stun2.l.google.com:19302','stun:stun.cloudflare.com:3478']},
-];
-/* Metered.ca TURN (free key): ?meteredapp=YOURAPP&meteredkey=YOURKEY  (app name = the part before .metered.live) */
-{const mA=QS.get('meteredapp'),mK=QS.get('meteredkey');if(mA&&mK)fetch('https://'+mA+'.metered.live/api/v1/turn/credentials?apiKey='+encodeURIComponent(mK)).then(r=>r.json()).then(a=>{if(Array.isArray(a))ICE_SERVERS.push(...a)}).catch(()=>{})}
-/* your own TURN: ?turn=turn:host:3478,user,pass  (repeat the param for several servers) */
-for(const tp of QS.getAll('turn')){const[u,n,c]=tp.split(',');if(u)ICE_SERVERS.push({urls:u,username:n,credential:c})}
-function peerOpts(){const o={debug:0,config:{iceServers:ICE_SERVERS,iceCandidatePoolSize:4,iceTransportPolicy:QS.get('relay')==='1'?'relay':'all'}};const h=QS.get('peerhost');
- if(h){o.host=h;o.port=+(QS.get('peerport')||443);o.path=QS.get('peerpath')||'/';o.secure=QS.get('peersecure')!=='0'}return o}
-function pcClose(soft){for(const k of['dc','cc']){const c=ol[k];ol[k]=null;if(c&&!soft){try{c.close()}catch(_){}}}ol.pcs='';ol.dcs='';ol.ccs=''}
-function killPeer(delay){const p=ol.pk;ol.pk=null;if(!p)return;const k=()=>{try{p.destroy()}catch(_){}};delay?setTimeout(k,300):k()}
+/* ws shim: the rest of the netcode talks to ol.cc / ol.dc as {open,send}; both are the single WebSocket */
+const wsChan=ws=>({get open(){return ws.readyState===1},send(d){ws.send(d)},close(){}});
+function pcClose(){ol.dc=null;ol.cc=null;ol.pcs='';ol.dcs='';ol.ccs=''}
+function killPeer(delay){const p=ol.pk;ol.pk=null;if(!p)return;const k=()=>{try{p.onopen=p.onmessage=p.onclose=p.onerror=null;p.close()}catch(_){}};delay?setTimeout(k,300):k()}
 function olReset(){ol.ics='';ctlSend({t:'bye'});pcClose(1);clearTimeout(ol.tO);killPeer(1);ol.role=null;ol.code='';ol.in='';ol.msg='';ol.peer=null;ol.net=0;ol.lk=0;ol.sgo=0;ol.rp=null;ol.mine=null;ol.pend=null;ol.ping=null;ol.dc2=0}
 function olFail(msg){pcClose();clearTimeout(ol.tO);killPeer(0);ol.st='error';ol.msg=msg;ol.peer=null}
-function startPeer(id){
- if(typeof Peer==='undefined'){olFail('PeerJS failed to load - check your internet connection or ad-blocker.');return null}
- if(typeof RTCPeerConnection==='undefined'){ol.pcs='unsupported';olFail('WebRTC is not supported in this browser.');return null}
- let p;try{p=new Peer(id,peerOpts())}catch(e){olFail('Could not start PeerJS.');return null}
- ol.pk=p;
- p.on('disconnected',()=>{if(ol.pk===p&&!p.destroyed){try{p.reconnect()}catch(_){}}});
- p.on('error',e=>{if(ol.pk!==p)return;const t=e&&e.type;
-  if(t==='peer-unavailable'&&ol.role==='guest'&&ol.st==='joining')return olFail('No room found with code '+ol.code+'.');
-  if(t==='unavailable-id')return olFail('Room code already in use - try again.');
-  if(ol.st==='host'||ol.st==='joining')olFail('Could not reach the signaling server'+(t?' ('+t+')':'')+'.')});
- return p}
-/* one PeerJS DataConnection -> ol.cc (label 'ctl') or ol.dc (label 'in') */
-function attach(c){const ctl=c.label==='ctl';
- if(ctl){ol.cc=c;ol.dc=c;ol.dcs=c.open?'open':'connecting';ol.ccs=ol.role==='host'&&c.open?'open':'connecting'}else{ol.dc=c;ol.dcs=c.open?'open':'connecting'}
- const mine=()=>ctl?ol.cc===c:ol.dc===c;
- const onOpen=()=>{if(!mine())return;
-  if(ctl){if(ol.role==='host'){ol.ccs='open';if(ol.st==='host'){ol.st='ready';sfx('ok')}ctlSend({t:'welcome'})}ol.dcs='open'}else ol.dcs='open';
-  const pc=c.peerConnection;if(pc&&!c._rfw){c._rfw=1;ol.pcs=pc.connectionState||'connected';pc.addEventListener('connectionstatechange',()=>{if(ol.dc===c||ol.cc===c)ol.pcs=pc.connectionState})}};
- c.on('open',onOpen);if(c.open)onOpen();
- {const q=c.peerConnection;if(q&&!c._rfi){c._rfi=1;ol.ics=q.iceConnectionState;q.addEventListener('iceconnectionstatechange',()=>{ol.ics=q.iceConnectionState})}}
- c.on('close',()=>chClosed(c,ctl));c.on('error',()=>chClosed(c,ctl));
- c.on('data',d=>{if(!mine())return;const e={data:typeof d==='string'?d:JSON.stringify(d)};let t='';try{t=JSON.parse(e.data).t}catch(_){}(t==='in'||t==='ping'||t==='pong')?onRemoteInput(e):ctlMsg(e)})}
-function chClosed(c,ctl){if((ctl?ol.cc:ol.dc)!==c)return;if(ctl){ol.ccs='closed';ol.dcs='closed'}else ol.dcs='closed';
- if(ol.net||ol.st==='error')return;
- if(ol.role==='host'&&ol.st==='ready'){pcClose();ol.peer=null;ol.st='host'}
- else if(ol.role==='guest'&&ol.st==='joining')olFail('Could not connect to the host.')}
+function startSocket(first){
+ if(typeof WebSocket==='undefined'){olFail('WebSockets are not supported in this browser.');return null}
+ const protocol=location.protocol==='https:'?'wss://':'ws://';
+ let socket;try{socket=new WebSocket(protocol+location.host)}catch(e){olFail('Could not reach the game server.');return null}
+ ol.pk=socket;
+ socket.onopen=()=>{if(ol.pk!==socket)return;try{socket.send(JSON.stringify(first))}catch(_){olFail('Could not reach the game server.')}};
+ socket.onmessage=e=>{if(ol.pk!==socket||typeof e.data!=='string')return;srvMsg(socket,e.data)};
+ socket.onerror=()=>{};
+ socket.onclose=()=>{if(ol.pk!==socket)return;ol.pk=null;ol.ccs=ol.dcs='closed';if(ol.st==='error'||!ol.role)return;
+  if(ol.net)onDisconnect('The connection to your opponent was lost.');else olFail('Lost connection to the game server.')};
+ return socket}
+function pairUp(socket){const c=wsChan(socket);ol.cc=c;ol.dc=c;ol.dcs='open';ol.ccs=ol.role==='host'?'open':'connecting'}
+/* every text frame from the server: room status first, otherwise a relayed frame from the opponent */
+function srvMsg(socket,raw){let m;try{m=JSON.parse(raw)}catch(_){return}if(!m||typeof m!=='object')return;const t=m.t;
+ if(t==='hosted'&&ol.role==='host')return;
+ if(t==='peer'&&ol.role==='host'&&!ol.net&&!ol.cc){ol.peer='guest';pairUp(socket);if(ol.st==='host'){ol.st='ready';sfx('ok')}ctlSend({t:'welcome'});return}
+ if(t==='joined'&&ol.role==='guest'&&ol.st==='joining'){ol.peer='host';pairUp(socket);return}
+ if(t==='err'&&(ol.st==='host'||ol.st==='joining'))return olFail(typeof m.msg==='string'?m.msg:'Server error.');
+ if(t==='full')return olFail('That room is already full.');
+ if(!ol.cc)return;
+ if(t==='in'||t==='ping'||t==='pong')return onRemoteInput({data:raw});
+ ctlMsg({data:raw})}
 function gotBye(){if(ol.net)return onDisconnect('Your opponent left the match.');
  if(ol.role==='host'){pcClose();ol.peer=null;ol.st='host'}else olFail('The host closed the room.')}
 function createRoom(){olReset();ol.role='host';ol.code=Array.from({length:5},()=>RALPH[Math.random()*RALPH.length|0]).join('');ol.st='host';
- const p=startPeer('rf-'+ol.code);if(!p)return;
- p.on('connection',c=>{const sid=c.metadata&&c.metadata.sid;
-  if(!ol.peer||ol.peer===sid){ol.peer=sid||'guest';attach(c)}
-  else c.on('open',()=>{if(c.label==='ctl'){try{c.send(JSON.stringify({t:'full'}))}catch(_){}}setTimeout(()=>{try{c.close()}catch(_){}},150)})})}
+ startSocket({t:'host',code:ol.code});
+ ol.tO=setTimeout(()=>{if(ol.st==='host'&&ol.pk&&ol.pk.readyState!==1)olFail('Could not reach the game server.')},20000)}
 function joinRoom(code){olReset();ol.role='guest';ol.code=code;ol.st='joining';
- const p=startPeer(undefined);if(!p)return;
- p.on('open',()=>{if(ol.pk!==p)return;const md={sid:ol.id},to='rf-'+code;ol.peer='host';
-  attach(p.connect(to,{label:'ctl',reliable:true,serialization:'json',metadata:md}));});
- ol.tO=setTimeout(()=>{if(ol.st==='joining')olFail('Could not connect to room '+code+'. A firewall/NAT may be blocking the direct link (TURN relay needed).')},45000)}
+ startSocket({t:'join',code});
+ ol.tO=setTimeout(()=>{if(ol.st==='joining')olFail('Could not connect to room '+code+'.')},45000)}
 function olBack(){if(ol.st==='choose')go('menu');else{olReset();ol.st='choose'}}
 /* step 5: syncStart - control channel 'ctl' (reliable, ordered) carries picks + the start message */
 function ctlSend(m){if(ol.cc&&ol.cc.open){try{ol.cc.send(JSON.stringify(m));return true}catch(_){}}return false}
@@ -1888,7 +1867,7 @@ function olClick(x,y){const inr=(a,b,w,h)=>x>=a&&x<a+w&&y>=b&&y<b+h;
 addEventListener('pagehide',()=>{if(ol.role){ctlSend({t:'bye'});killPeer(0)}});
 function obtn(x,y,w,h,label,on,col){X.save();if(on){X.shadowColor=col;X.shadowBlur=22+Math.sin(performance.now()/200)*6}rr(x,y,w,h,12);const g=X.createLinearGradient(x,y,x+w,y);g.addColorStop(0,on?col+'cc':col+'44');g.addColorStop(1,'rgba(12,6,26,.9)');X.fillStyle=g;X.fill();X.restore();X.save();rr(x,y,w,h,12);X.strokeStyle=on?'#fff':col+'99';X.lineWidth=on?4:2;X.stroke();X.restore();stx(label.length>8?26:34,'#fff','center',label,x+w/2,y+h/2+11)}
 function drawOnline(){bg();X.fillStyle='rgba(10,5,25,.74)';X.fillRect(0,0,960,540);
- const T=performance.now(),st=ol.st,dots='.'.repeat(1+Math.floor(T/400)%3),note=QS.get('peerhost')?'Signaling: PeerJS server '+QS.get('peerhost'):'Signaling: PeerJS cloud server (0.peerjs.com)';
+ const T=performance.now(),st=ol.st,dots='.'.repeat(1+Math.floor(T/400)%3),note='Server: '+location.host;
  stx(46,'#fff','center','ONLINE',480,68);X.fillStyle='#ffb15c';X.fillRect(400,78,160,3);
  rr(396,90,168,26,8);X.fillStyle='#ffd36a';X.fill();txt('WORK IN PROGRESS',480,108,13,'#2a1400','center',MONO);
  rr(20,20,96,36,8);X.fillStyle='rgba(30,16,56,.9)';X.fill();X.strokeStyle='rgba(255,255,255,.5)';X.lineWidth=2;X.stroke();stx(20,'#fff','center','BACK',68,46);
@@ -1898,7 +1877,7 @@ function drawOnline(){bg();X.fillStyle='rgba(10,5,25,.74)';X.fillRect(0,0,960,54
   txt(note,480,450,12,'#b9aed0','center',MONO);hint(isT()?'Tap an option':'W / S  choose      Enter  confirm      Esc  back')}
  else if(st==='host'){txt('ROOM CODE',480,160,18,'#ffd36a','center',MONO);
   for(let k=0;k<5;k++){const x=260+k*90;rr(x,176,80,96,10);X.fillStyle='rgba(12,6,26,.92)';X.fill();X.strokeStyle='#ffd36a';X.lineWidth=3;X.stroke();stx(72,'#fff','center',ol.code[k],x+40,248)}
-  txt('Share this code with your opponent',480,320,16,'#fff','center',MONO);stx(26,'#ffd36a','center',ol.peer?'Guest found - connecting'+dots:'Waiting for opponent'+dots,480,370);if(ol.peer)txt('ICE: '+(ol.ics||'starting')+(ol.ics==='failed'||ol.ics==='disconnected'?'  - TURN server needed (see ?meteredapp=&meteredkey= or ?turn=)':''),480,400,14,ol.ics==='failed'?'#ff9a8a':'#e6dcf5','center',MONO);
+  txt('Share this code with your opponent',480,320,16,'#fff','center',MONO);stx(26,'#ffd36a','center',ol.peer?'Guest found - connecting'+dots:'Waiting for opponent'+dots,480,370);
   txt(note,480,450,12,'#b9aed0','center',MONO);hint('Esc  leave room')}
  else if(st==='join'){
   for(let k=0;k<5;k++){const x=324+k*64,on=k===ol.in.length;rr(x,132,56,52,8);X.fillStyle='rgba(12,6,26,.92)';X.fill();X.strokeStyle=on?'#ffd36a':'rgba(255,255,255,.4)';X.lineWidth=on?3:2;X.stroke();if(ol.in[k])stx(36,'#fff','center',ol.in[k],x+28,x*0+170)}
@@ -1907,10 +1886,10 @@ function drawOnline(){bg();X.fillStyle='rgba(10,5,25,.74)';X.fillRect(0,0,960,54
   rr(275,406,200,42,10);X.fillStyle='rgba(30,16,56,.92)';X.fill();X.strokeStyle='rgba(255,255,255,.5)';X.lineWidth=2;X.stroke();stx(22,'#fff','center','DEL',375,436);
   rr(485,406,200,42,10);X.fillStyle=can?'rgba(63,214,160,.95)':'rgba(30,16,56,.6)';X.fill();X.strokeStyle=can?'#fff':'rgba(255,255,255,.25)';X.lineWidth=2;X.stroke();stx(22,can?'#06251b':'#8a7aa8','center','JOIN',585,436);
   hint(isT()?'Enter the 5-character room code':'Type the room code or use the keypad      Enter  join      Esc  back')}
- else if(st==='joining'){stx(34,'#fff','center','Looking for room '+ol.code+dots,480,240);txt('ICE: '+(ol.ics||'waiting for host'),480,290,14,ol.ics==='failed'?'#ff9a8a':'#e6dcf5','center',MONO);txt(note,480,450,12,'#b9aed0','center',MONO);hint('Esc  cancel')}
+ else if(st==='joining'){stx(34,'#fff','center','Looking for room '+ol.code+dots,480,240);txt(ol.peer?'Room found - connecting':'Contacting server (may take a moment if it was asleep)',480,290,14,'#e6dcf5','center',MONO);txt(note,480,450,12,'#b9aed0','center',MONO);hint('Esc  cancel')}
  else if(st==='ready'){const pu=.8+.2*Math.sin(T/200);X.save();X.globalAlpha=pu;stx(54,'#7ff0a0','center','OPPONENT CONNECTED',480,220);X.restore();
   txt('Room '+ol.code+'   -   you are the '+(ol.role==='host'?'HOST':'GUEST'),480,262,18,'#ffd36a','center',MONO);
-  const ps=ol.pcs==='unsupported'?'WebRTC is not supported in this browser':ol.pcs==='error'?'could not create the peer connection':'WebRTC peer '+(ol.pcs||'none')+'  (STUN: '+ICE_SERVERS[0].urls.length+' servers)';txt(ps,480,320,15,ol.pcs==='failed'||ol.pcs==='error'||ol.pcs==='unsupported'?'#ff9a8a':'#7ff0a0','center',MONO);txt('Data channel: '+(ol.dcs||'none')+(ol.role==='guest'&&!ol.dc?' (waiting for host)':''),480,342,15,ol.dcs==='open'?'#7ff0a0':'#e6dcf5','center',MONO);txt(ol.dcs==='open'?'LINK ESTABLISHED - starting...':ol.pcs==='failed'?'Link failed - a TURN server may be needed':'Connecting...',480,364,15,ol.dcs==='open'?'#7ff0a0':'#e6dcf5','center',MONO);hint('Esc  leave room')}
+  txt('Relay: connected',480,320,15,'#7ff0a0','center',MONO);txt('Data channel: '+(ol.dcs||'none')+(ol.role==='guest'&&!ol.dc?' (waiting for host)':''),480,342,15,ol.dcs==='open'?'#7ff0a0':'#e6dcf5','center',MONO);txt(ol.dcs==='open'?'LINK ESTABLISHED - starting...':'Connecting...',480,364,15,ol.dcs==='open'?'#7ff0a0':'#e6dcf5','center',MONO);hint('Esc  leave room')}
  else if(st==='error'){stx(46,'#ff6b5a','center',ol.dc2?'DISCONNECTED':"CAN'T CONNECT",480,230);txt(ol.msg,480,280,18,'#fff','center',MONO);hint(isT()?'Tap to go back':'Enter  back')}}
 
 pres[10]=Object.assign(mkPre(),{ch:10});
